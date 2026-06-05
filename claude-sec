@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# claude-sec — install / update the Claude Code hardening template.
+#
+# Subcommands:
+#   .              Copy this checkout's _claude/ template into ./.claude
+#                  in the current working directory.
+#   update         git pull --ff-only inside this checkout.
+#   self-install   Symlink this script into $CLAUDE_SEC_BIN_DIR so it's
+#                  available as `claude-sec` on $PATH. The script
+#                  stays in the cloned repo; updates flow through it.
+#   help           Show the usage message.
+#
+# Environment overrides:
+#   CLAUDE_SEC_BIN_DIR   where to symlink the binary (default below)
+#
+# Modeled on
+# https://github.com/damianrusinek/ai-sandbox-devcontainer/blob/main/install.sh
+# (which uses the `_devcontainer/` convention; here we use `_claude/`).
+set -euo pipefail
+
+# ---------- defaults ----------
+
+BIN_DIR="${CLAUDE_SEC_BIN_DIR:-$HOME/.local/bin}"
+BIN_NAME="claude-sec"
+TEMPLATE_NAME="_claude"
+DEST_NAME=".claude"
+# Supported OS keys for the per-OS settings.*.json templates.
+SUPPORTED_OSES="unix windows"
+
+# ---------- colors ----------
+#
+# Honor NO_COLOR (https://no-color.org/) and skip escapes when stdout
+# is not a terminal — keeps output clean when piped or captured.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_CYAN=$'\033[36m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_RED=$'\033[31m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""
+    C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_RED=""
+fi
+TAG="${C_BOLD}${C_CYAN}claude-sec${C_RESET}"
+
+# ---------- helpers ----------
+
+die()    { printf '%s %s%s%s\n'      "$TAG" "$C_RED"    "$*" "$C_RESET" >&2; exit 1; }
+info()   { printf '%s %s\n'          "$TAG" "$*"; }
+ok()     { printf '%s %s✓%s %s\n'    "$TAG" "$C_GREEN"  "$C_RESET" "$*"; }
+warn()   { printf '%s %s!%s %s\n'    "$TAG" "$C_YELLOW" "$C_RESET" "$*" >&2; }
+step()   { printf '%s %s→%s %s\n'    "$TAG" "$C_CYAN"   "$C_RESET" "$*"; }
+note()   { printf '%s %s%s%s\n'      "$TAG" "$C_DIM"    "$*" "$C_RESET"; }
+
+confirm() {
+    local prompt="$1" ans
+    printf '%s %s? %s%s%s [y/N]: ' "$TAG" "$C_YELLOW" "$C_RESET" "$prompt" ""
+    read -r ans || ans=""
+    case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# Resolve the directory of this script, following symlinks portably
+# (so a self-installed symlink in $BIN_DIR resolves back to the repo).
+resolve_script_dir() {
+    local src="${BASH_SOURCE[0]}"
+    while [ -L "$src" ]; do
+        local dir
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ $src != /* ]] && src="$dir/$src"
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
+
+# Detect which settings.<os>.json template to use.
+# Overridable with CLAUDE_SEC_OS=unix|windows.
+detect_os() {
+    if [ -n "${CLAUDE_SEC_OS:-}" ]; then
+        printf '%s\n' "$CLAUDE_SEC_OS"
+        return
+    fi
+    case "$(uname -s 2>/dev/null || true)" in
+        Darwin*|Linux*|*BSD*)  echo unix ;;
+        CYGWIN*|MINGW*|MSYS*)  echo windows ;;
+        *)
+            if [ "${OS:-}" = "Windows_NT" ]; then
+                echo windows
+            else
+                die "could not detect OS — set CLAUDE_SEC_OS=unix|windows"
+            fi
+            ;;
+    esac
+}
+
+usage() {
+    cat <<EOF
+${C_BOLD}${C_CYAN}claude-sec${C_RESET} — install / update the Claude Code hardening template.
+
+${C_BOLD}USAGE${C_RESET}
+    claude-sec <subcommand>
+
+${C_BOLD}SUBCOMMANDS${C_RESET}
+    ${C_GREEN}.${C_RESET}              Copy this checkout's ${C_DIM}_claude/${C_RESET} into ${C_DIM}./.claude${C_RESET} in
+                   the current working directory. Picks the OS-specific
+                   settings template at install time.
+    ${C_GREEN}update${C_RESET}         ${C_DIM}git pull --ff-only${C_RESET} inside this checkout.
+    ${C_GREEN}self-install${C_RESET}   Symlink this script into ${C_DIM}BIN_DIR${C_RESET} so 'claude-sec'
+                   works from any directory. Does ${C_BOLD}not${C_RESET} clone or move
+                   the repo; you keep it wherever you cloned it.
+    ${C_GREEN}help${C_RESET}           Show this message.
+
+${C_BOLD}ENVIRONMENT${C_RESET}
+    ${C_YELLOW}CLAUDE_SEC_BIN_DIR${C_RESET}   where to place the symlink
+                         (default: ${C_DIM}$BIN_DIR${C_RESET})
+    ${C_YELLOW}CLAUDE_SEC_OS${C_RESET}        OS key for the settings template
+                         (one of: ${C_DIM}$SUPPORTED_OSES${C_RESET};
+                          default: auto-detected via ${C_DIM}uname${C_RESET})
+    ${C_YELLOW}NO_COLOR${C_RESET}             set to disable ANSI colors
+EOF
+}
+
+# ---------- subcommands ----------
+
+# `.` — copy _claude/ into the current directory as .claude/, then
+#       promote the OS-specific settings.<os>.json to settings.json
+#       and drop the other variants.
+cmd_dot() {
+    local src="$SCRIPT_DIR/$TEMPLATE_NAME"
+    local dest="$PWD/$DEST_NAME"
+    local os settings_src
+    os="$(detect_os)"
+    settings_src="$src/settings.$os.json"
+
+    [ -d "$src" ] || die "template not found at $src — is this script inside the claude-sec repo?"
+    [ -f "$settings_src" ] || \
+        die "no settings template for OS=$os at $settings_src — set CLAUDE_SEC_OS to one of: $SUPPORTED_OSES"
+
+    if [ -e "$dest" ]; then
+        [ -d "$dest" ] || die "destination exists and is not a directory: $dest"
+        warn "destination already exists: $dest"
+        confirm "overwrite it?" || die "aborted by user"
+        rm -rf "$dest"
+    fi
+
+    step "copying template (OS: ${C_BOLD}$os${C_RESET}) into $dest"
+    cp -R "$src" "$dest"
+
+    # Promote the OS-specific settings template; drop the other variants.
+    mv "$dest/settings.$os.json" "$dest/settings.json"
+    local other
+    for other in $SUPPORTED_OSES; do
+        [ "$other" = "$os" ] && continue
+        rm -f "$dest/settings.$other.json"
+    done
+
+    ok "template installed to $dest"
+    note "next: open Claude Code in this project and run /hardener-init"
+}
+
+# `update` — git pull in this checkout
+cmd_update() {
+    [ -d "$SCRIPT_DIR/.git" ] || \
+        die "$SCRIPT_DIR is not a git checkout — clone the repo and re-run from there"
+    command -v git >/dev/null 2>&1 || die "git is required but was not found on PATH"
+
+    local branch rev
+    branch="$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD)"
+    step "fetching origin (branch ${C_BOLD}$branch${C_RESET})"
+    git -C "$SCRIPT_DIR" fetch --quiet origin
+    git -C "$SCRIPT_DIR" pull --ff-only origin "$branch"
+    rev="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)"
+    ok "updated $SCRIPT_DIR to $rev (branch $branch)"
+}
+
+# `self-install` — symlink this script into BIN_DIR
+cmd_self_install() {
+    mkdir -p "$BIN_DIR"
+
+    local script_src="$SCRIPT_DIR/$BIN_NAME"
+    local script_dest="$BIN_DIR/$BIN_NAME"
+
+    [ -f "$script_src" ] || die "expected $BIN_NAME at $script_src — is this script inside the claude-sec repo?"
+    step "symlinking $script_src → $script_dest"
+    chmod +x "$script_src"
+    ln -sf "$script_src" "$script_dest"
+    ok "claude-sec is now installed at $script_dest"
+
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *)
+            warn "$BIN_DIR is not on your PATH"
+            note "  add this to your shell rc (~/.bashrc, ~/.zshrc, …):"
+            note "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+            ;;
+    esac
+}
+
+# ---------- main ----------
+
+main() {
+    if [ $# -eq 0 ]; then
+        usage
+        exit 0
+    fi
+
+    local sub="$1"; shift
+    case "$sub" in
+        .|dot)            cmd_dot "$@" ;;
+        update)           cmd_update "$@" ;;
+        self-install)     cmd_self_install "$@" ;;
+        help|-h|--help)   usage ;;
+        *)
+            warn "unknown subcommand: $sub"
+            printf '\n' >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": false,
+    "excludedCommands": [],
+    "allowUnsandboxedCommands": false,
+    "enableWeakerNestedSandbox": false,
+    "enableWeakerNetworkIsolation": false,
+    "filesystem": {
+      "denyRead": [],
+      "allowRead": ["."],
+      "denyWrite": [],
+      "allowWrite": ["."]
+    },
+    "network": {
+      "allowedDomains": [],
+      "deniedDomains": ["*"],
+      "allowUnixSockets": [],
+      "allowAllUnixSockets": false,
+      "allowLocalBinding": false,
+      "allowMachLookup": []
+    }
+  },
+  "disableBypassPermissionsMode": "disable",
+  "permissions": {
+    "defaultMode": "default",
+    "allow": [],
+    "ask": [],
+    "deny": [
+      "WebFetch",
+      "WebSearch"
+    ]
+  },
+  "enabledPlugins": {
+    "security-guidance@claude-plugins-official": true
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hardening/check-session-start.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read|Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hardening/check-file-access.sh || exit 2"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "You are about to call an MCP tool (its name starts with `mcp__`). Audit it before the call proceeds.\n\n1. Identify the exact tool by its full name `mcp__<server>__<tool>`.\n\n2. If you have already approved this exact tool earlier in this session, or have recorded an approval for it in your persistent memory, skip steps 3-4 and proceed with the call.\n\n3. Otherwise, use the `/security-review` skill to review the tool. Classify it as DANGEROUS if it can do any of the following:\n   - Read, write, move, or delete files outside the workspace root, bypassing the `.claude/hardening/` file-access policy.\n   - Reach network destinations that `sandbox.network.deniedDomains: [\"*\"]` in `.claude/settings.json` would normally block.\n   - Execute arbitrary code, shell commands, or other unsandboxed processes.\n   - Read or transmit secrets, credentials, API tokens, or environment variables.\n\n4. If the tool is DANGEROUS: refuse the call, tell the user exactly which capability triggered the classification, and ask whether to override before retrying.\n\n5. If the tool is SAFE: record an approval for `mcp__<server>__<tool>` in your memory system (a short note keyed by the full tool name is sufficient), then proceed with the call. Future invocations of the same tool must short-circuit at step 2."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Before running this Bash command, inspect it for paths that the file-access policy would block: (a) any path outside the workspace root (the current working directory), unless the path is listed in .claude/hardening/allow-paths.txt; or (b) any path inside the workspace that matches an entry in .claude/hardening/deny-workspace-paths.txt. This includes read operations (cat, less, head, tail, grep, find, etc.) and operations that consume the path indirectly (cp, mv, rm, tar, rsync, ln, sed -i, redirections, here-docs, and process substitutions). If the command references such a path, stop and ask the user for explicit confirmation before executing, naming each sensitive path and what the command will do with it. If the command references no such paths, proceed normally without prompting."
+          }
+        ]
+      }
+    ]
+  }
+}

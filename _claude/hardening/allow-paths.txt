@@ -1,0 +1,29 @@
+# Paths that Claude Code may READ ONLY, evaluated FIRST in the policy.
+# Write-shaped tools (Write / Edit / MultiEdit / NotebookEdit) never
+# consult this list, so entries here cannot be used to bypass the
+# workspace-write boundary.
+#
+# Use this file for two things:
+#
+#   1. Whitelist specific paths OUTSIDE the workspace for reading
+#      (e.g. caches, scratch dirs, shared inputs).
+#
+#   2. Re-allow READING specific paths INSIDE the workspace that
+#      would otherwise be blocked by deny-workspace-paths.txt
+#      (e.g. read `secrets/public/` while `secrets/` is denied).
+#
+# Rules:
+#   - One path per line.
+#   - Blank lines and lines starting with '#' are ignored.
+#   - Absolute paths are recommended for external paths. '~' expands to
+#     the current user's home directory.
+#   - Relative paths are resolved against the workspace root, which is
+#     useful for re-allowing workspace-internal subpaths.
+#   - A file entry matches only that exact file.
+#   - A directory entry matches the directory and every descendant.
+#   - Entries here take precedence over deny-workspace-paths.txt.
+#
+# Examples (uncomment as needed):
+# ~/.cache/some-tool
+# /tmp/project-inputs
+# secrets/public/

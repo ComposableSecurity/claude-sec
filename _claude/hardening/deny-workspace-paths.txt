@@ -1,0 +1,16 @@
+# Paths inside the workspace that Claude Code must NOT Read / Write / Edit / MultiEdit.
+#
+# Rules:
+#   - One path per line.
+#   - Blank lines and lines starting with '#' are ignored.
+#   - Relative paths are resolved against the workspace root.
+#   - Absolute paths and '~' are also supported.
+#   - A file entry blocks only that exact file.
+#   - A directory entry blocks the directory and every descendant.
+#
+# Examples (uncomment as needed):
+# .env
+# .env.local
+# secrets/
+# private/
+.env
