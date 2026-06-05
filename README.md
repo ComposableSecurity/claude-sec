@@ -62,7 +62,7 @@ The repository ships a small installer at the root, `claude-sec`.
 
 Installation steps:
 ```bash
-git clone <this-repo> ~/.claude-sec     # put the repo wherever you like
+git clone https://github.com/damianrusinek/claude-sec ~/.claude-sec     # put the repo wherever you like
 cd ~/.claude-sec
 ./claude-sec self-install                  # one-time: symlink into PATH
 cd ~/some-project
