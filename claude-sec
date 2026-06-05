@@ -13,9 +13,6 @@
 # Environment overrides:
 #   CLAUDE_SEC_BIN_DIR   where to symlink the binary (default below)
 #
-# Modeled on
-# https://github.com/damianrusinek/ai-sandbox-devcontainer/blob/main/install.sh
-# (which uses the `_devcontainer/` convention; here we use `_claude/`).
 set -euo pipefail
 
 # ---------- defaults ----------
