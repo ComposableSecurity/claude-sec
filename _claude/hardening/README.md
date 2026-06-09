@@ -29,14 +29,12 @@ implementation and the path-policy behavior.
 
 | File | Purpose |
 | --- | --- |
-| `check-file-access.py` | Reference hook implementation (Python). Reads PreToolUse JSON from stdin and decides allow / deny. |
-| `check-file-access.sh` | Thin Bash wrapper for macOS / Linux. Probes for Python on `PATH` (`python3`, `python`) and **fails closed** if none is found. |
-| `check-file-access.ps1` | **Standalone PowerShell port** of the policy for Windows. No Python dependency. Must stay in decision lockstep with `check-file-access.py`. |
-| `check-session-start.sh` | SessionStart hook for macOS / Linux. Pure bash; if `.initialized` is absent, emits a `hookSpecificOutput.additionalContext` JSON object instructing Claude to display a welcome banner to the user and recommend `/hardener-init`. Plain stdout from a SessionStart hook is captured as model context, not printed to the user, so the JSON-with-instruction pattern is what makes the banner actually visible. Bails silently when running on Windows so the `.ps1` sibling handles it. |
-| `check-session-start.ps1` | SessionStart hook for Windows. Pure PowerShell; same behaviour, mirrored. Bails silently on non-Windows so the `.sh` sibling handles it. |
+| `check-file-access.py` | The PreToolUse hook (Python). Reads JSON from stdin and decides allow / deny. |
+| `check-file-access.sh` | Thin Bash wrapper. Probes for Python on `PATH` (`python3`, `python`) and **fails closed** if none is found. |
+| `check-session-start.sh` | SessionStart hook. Pure bash; runs two independent checks at session start: (a) is `deny-workspace-paths.txt` still empty? (b) is the `security-guidance` plugin enabled in `settings.json` while `claude-security-guidance.md` is missing at the project root? Whichever check fails contributes a banner block; the blocks are combined into a single `hookSpecificOutput.additionalContext` payload that instructs Claude to display the banner(s) to the user on its first turn. Silent when both checks pass. Plain stdout from a SessionStart hook is captured as model context, not printed to the user, so the JSON-with-instruction pattern is what makes the banner actually visible. |
+| `features/` | Optional-feature snippets that `claude-sec configure` merges into `.claude/settings.json` (security-guidance plugin, Bash review prompt, MCP audit prompt). One snippet per `*.json` file; the `NN-` prefix controls the order they're presented to the user. The format and merge semantics are documented in [`features/README.md`](features/README.md). |
 | `allow-paths.txt` | Paths that should be allowed for **Read only** even when the default policy would deny them. Use for external paths (caches, scratch dirs) and for re-allowing reads of workspace subpaths that `deny-workspace-paths.txt` would otherwise block. Write-shaped tools never consult this list. |
 | `deny-workspace-paths.txt` | Paths inside the workspace that Claude Code may not access. For reads, an entry in `allow-paths.txt` can override this; writes remain denied. |
-| `.initialized` *(absent by default)* | Marker file. While absent, the hook opens a [bootstrap window](#bootstrap-window) that lets the policy files be edited even if the hardening dir is in the deny list. Once present, the window closes and normal policy applies. |
 
 ## Policy order
 
@@ -44,22 +42,30 @@ For every Read / Write / Edit / MultiEdit / NotebookEdit call the
 script evaluates the target path (`tool_input.file_path`, or
 `tool_input.notebook_path` for `NotebookEdit`) in this exact order:
 
-0. **Bootstrap window:** if `.claude/hardening/.initialized` does
-   **not** exist and the target is **anywhere inside `.claude/`**,
-   **allow**. See [Bootstrap window](#bootstrap-window) below.
 1. **Allow** if the tool is `Read` **and** the target matches an
    entry in `allow-paths.txt`.
 2. **Deny** if the target is outside the workspace root
    (the `cwd` field of the PreToolUse event).
-3. **Deny** if the target is **anywhere inside `.claude/`** (implicit
-   protection of the hardening config; active only after
-   `.initialized` exists).
+3. **Deny** if the target is **anywhere inside `.claude/`**
+   (implicit protection of the hardening config).
+   *Exceptions:*
+   - `deny-workspace-paths.txt` is **always readable** (so the
+     agent can inspect the deny list it is subject to) and is
+     **writable while it has no active rules yet** (the one-shot
+     first-time-setup window).
+   - `settings.json` is **always readable** (so the agent can
+     inspect the active feature toggles and sandbox config) but
+     is **never writable** from Claude Code's file tools.
+
+   See [Editing the policy files](#editing-the-policy-files)
+   below.
 4. **Deny** if the target matches an entry in `deny-workspace-paths.txt`.
 5. Otherwise **allow**.
 
 In short: allow specified paths first **for reads only**, then deny
-everything else outside the workspace, then deny selected paths inside
-the workspace.
+everything else outside the workspace, then deny everything inside
+`.claude/` (with one narrow exception for first-time setup), then
+deny configured paths inside the workspace.
 
 `allow-paths.txt` grants **read-only** access. The write-shaped tools
 (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) skip step 1 entirely,
@@ -75,43 +81,46 @@ This is intentional: external paths are typically read-only inputs
 (caches, configs), and re-opening a denied subdirectory for reads
 is a much smaller concession than re-opening it for writes.
 
-## Bootstrap window
+## Editing the policy files
 
-The hardening setup ships with an implicit deny on the entire
-`.claude/` directory — once first-time setup is complete, neither
-Claude Code nor the agent itself can read or write any hardening
-file. To avoid the chicken-and-egg problem of locking yourself out
-before you've configured anything, the hook gives you a one-shot
-bootstrap window:
+The implicit `.claude/` deny at step 3 protects the hardening
+config from the agent — Claude's built-in file tools cannot edit
+`allow-paths.txt`, the hook scripts, the skills, or anything else
+under `.claude/`. There are two narrow exceptions, split by file:
 
-- **While `.claude/hardening/.initialized` does not exist**, the
-  hook unconditionally allows access to **anything inside
-  `.claude/`** — policy lists, `settings.json`, the scripts
-  themselves, the `hardener-init` skill, etc.
-- This bypass applies to all guarded tools (Read, Write, Edit,
-  MultiEdit, NotebookEdit) and overrides every other rule in the
-  policy order.
-- **Once `.initialized` exists**, the bootstrap step is skipped
-  and the implicit deny at step 3 kicks in: every `.claude/` path
-  is denied. A specific subpath can still be re-opened **for
-  reading** by listing it in `allow-paths.txt` (the read-only
-  override at step 1 runs before the implicit deny); writes
-  remain denied.
+**`deny-workspace-paths.txt`** — read/write asymmetric:
 
-The intended flow:
+- **Reads are always allowed**, regardless of whether the file
+  has rules. The agent needs to be able to inspect the deny list
+  it is subject to (and the `claude-sec-fill-deny-paths` skill's
+  precondition check depends on this).
+- **Writes are only allowed while the file has no active rules**
+  (only blank lines and `#` comments). This lets the
+  `claude-sec-fill-deny-paths` skill populate the deny list on a
+  fresh project, and locks the file to writes the moment the
+  first rule is added.
 
-1. Drop the hardening setup into a project (`claude-sec .`).
-2. Run the `hardener-init` skill in Claude Code. The wizard edits
-   `allow-paths.txt`, `deny-workspace-paths.txt`, `settings.json`,
-   etc. — all permitted because the bootstrap window is open — and
-   creates `.claude/hardening/.initialized` at the end.
-3. The `.initialized` marker closes the bootstrap window and
-   activates the implicit `.claude/` deny.
+**`settings.json`** — read-only from inside Claude Code:
 
-After that point the policy seals: the agent can no longer edit
-the hardening config without the user first deleting `.initialized`
-manually (from outside Claude Code, since the `.claude/` deny
-includes the marker file itself).
+- **Reads are always allowed**, so the agent can see which
+  features are enabled, what the sandbox config looks like,
+  and which optional hooks are active (the
+  `claude-sec-generate-security-guidance` skill's precondition
+  check depends on this).
+- **Writes are never allowed.** Settings are edited through
+  `claude-sec configure` / `claude-sec update-paths` (which run
+  outside the hook's reach as ordinary shell commands), or by
+  opening the file in a regular editor outside Claude Code.
+
+Everything else in `.claude/` is fully sealed from Claude Code's
+file tools — neither readable nor writable. That's intentional:
+it keeps the agent away from the surface that governs its own
+restrictions.
+
+To re-open `deny-workspace-paths.txt` for writing later, clear the
+file from outside Claude Code (remove every active rule). Don't do
+this casually — once the file is empty, the agent can rewrite the
+workspace deny list at will until it adds at least one rule again.
 
 ## Adding allow paths
 
@@ -160,107 +169,48 @@ private/
 - `.` and `..` are resolved.
 - Symlinks are resolved when possible (non-existent paths fall back to
   pure normalization).
-- On **Windows**, path comparison is case-insensitive.
-- On **macOS / Linux**, path comparison is case-sensitive. macOS volumes
-  that are themselves case-insensitive will still treat siblings that
-  differ only in case as distinct from this hook's point of view; we
-  follow the POSIX default rather than probing the filesystem.
+- Path comparison is case-sensitive (POSIX default). macOS volumes
+  that are themselves case-insensitive will still treat siblings
+  that differ only in case as distinct from this hook's point of
+  view; we follow the POSIX default rather than probing the
+  filesystem.
 - Matching uses strict path boundaries: `/tmp/foo` does **not** match
   `/tmp/foobar`. A directory entry matches itself and any descendant
   separated by an OS path separator.
 
-## Cross-platform hook wiring
+## Hook wiring
 
-[`../settings.json`](../settings.json) registers **both** wrappers as
-PreToolUse hooks for the same matcher:
+[`../settings.json`](../settings.json) registers one PreToolUse
+hook command:
 
 ```json
 "hooks": [
   { "type": "command",
-    "command": "bash .claude/hardening/check-file-access.sh || exit 2" },
-  { "type": "command",
-    "command": "pwsh -NoProfile -File .claude/hardening/check-file-access.ps1 || exit 2" }
+    "command": "bash .claude/hardening/check-file-access.sh || exit 2" }
 ]
 ```
 
 The `|| exit 2` tail is a fail-closed safety net: if the wrapper
-crashes, the script file is missing, or the launching shell itself
-is not on `PATH`, the shell falls through and exits `2`, which
-Claude Code treats as a hard deny on the tool call. A broken hook
-never leaves the file tools unguarded.
-
-The configuration works on hosts that have both shells installed
-(common on macOS via Homebrew's `powershell`, on Linux via the
-`powershell` deb/snap, and on Windows with Git Bash + the system
-PowerShell). On those hosts:
-
-- **macOS / Linux:** `bash` runs the `.sh` wrapper, which execs the
-  Python policy script.
-- **Windows:** `pwsh` runs the standalone `.ps1` script — no Python
-  required.
-- **Hosts with both:** both entries run; both implementations agree
-  on the decision (decision lockstep is enforced); Claude Code
-  denies if either denies.
-
-### Hosts that lack one of the two shells
-
-Because of the `|| exit 2` safety net, the failing entry **denies**
-rather than silently no-ops. On a macOS/Linux host without `pwsh`,
-the pwsh entry would deny every guarded tool call; on a Windows host
-without `bash`, the bash entry would. Pick one of:
-
-1. Install the missing shell. PowerShell is freely available for
-   macOS/Linux; Git Bash is freely available for Windows.
-2. Remove the entry for the platform you don't ship to. This loses
-   portability of `.claude/settings.json` across platforms but is the
-   right call if a project is single-platform.
-3. Soften that single entry by dropping its `|| exit 2`. This
-   restores the silent no-op behavior for that one shell while
-   keeping the other entry fail-closed.
-
-Option (1) keeps the file portable and the security posture
-unchanged. Prefer it.
+crashes, the script file is missing, or `bash` itself is not on
+`PATH`, the shell falls through and exits `2`, which Claude Code
+treats as a hard deny on the tool call. A broken hook never leaves
+the file tools unguarded.
 
 ### Handling missing Python
 
-The `.sh` wrapper probes `PATH` for a Python interpreter (`python3`,
-then `python`; the `PYTHON` environment variable overrides). If none
-is found it **fails closed**: it emits a PreToolUse deny JSON and
-exits 0. A host that wired up this hook but has no Python cannot
-evaluate the policy via Python, so the safer default is to refuse
-the call rather than silently allow it.
-
-On Windows the `.ps1` script does not depend on Python — it is a
-direct PowerShell port of `check-file-access.py`. Windows hosts
-therefore have no "missing Python" failure mode for the hook.
-
-### Keeping the two implementations in lockstep
-
-`check-file-access.py` and `check-file-access.ps1` implement the
-same policy. Whenever you change one — adding a guarded tool,
-adjusting path normalization, refining a deny reason — make the
-matching change in the other in the same commit, and re-run the
-manual tests below against both.
-
-To run the policy script directly without the platform wrappers
-(e.g. on a host where you know Python is available and don't want
-the dual-entry setup), replace the two hook entries with one:
-
-```json
-"hooks": [
-  { "type": "command",
-    "command": "bash .claude/hardening/check-file-access.sh" }
-]
-```
+The `.sh` wrapper probes `PATH` for a Python interpreter
+(`python3`, then `python`; the `PYTHON` environment variable
+overrides). If none is found it **fails closed**: it emits a
+PreToolUse deny JSON and exits 0. A host that wired up this hook
+but has no Python cannot evaluate the policy via Python, so the
+safer default is to refuse the call rather than silently allow it.
 
 ## Manual testing
 
-Pipe a sample PreToolUse JSON payload into the wrapper for your
-platform (`check-file-access.sh` on macOS/Linux,
-`check-file-access.ps1` on Windows). Allow prints nothing and exits 0;
-deny prints a JSON object on stdout and exits 0. The wrappers and the
-Python script are interchangeable for testing — both honor the same
-input and produce the same output.
+Pipe a sample PreToolUse JSON payload into the wrapper. Allow
+prints nothing and exits 0; deny prints a JSON object on stdout
+and exits 0. The wrapper and the Python script are interchangeable
+for testing — both honor the same input and produce the same output.
 
 Set `WORKSPACE` to this project's root for the examples below.
 
@@ -317,24 +267,24 @@ explicit, e.g. `Write denied: target path is outside the workspace
 root and allow-paths.txt grants Read access only (Write is a
 write-shaped tool) ...`.
 
-**6. Bootstrap window: editing policy files works even when the
-hardening dir is denied.**
+**6. Writing `deny-workspace-paths.txt` works while it has no
+active rules, then locks down.**
 
-Add `.claude/hardening/` to `deny-workspace-paths.txt` and make sure
-`.claude/hardening/.initialized` does not exist, then:
+With a freshly installed template (`deny-workspace-paths.txt`
+contains only comments):
 
 ```bash
-rm -f .claude/hardening/.initialized
-echo '{"tool_name":"Write","tool_input":{"file_path":"'"$WORKSPACE"'/.claude/hardening/allow-paths.txt"},"cwd":"'"$WORKSPACE"'"}' \
-  | bash .claude/hardening/check-file-access.sh        # allow (bootstrap)
+# First write is allowed — empty deny list.
+echo '{"tool_name":"Write","tool_input":{"file_path":"'"$WORKSPACE"'/.claude/hardening/deny-workspace-paths.txt"},"cwd":"'"$WORKSPACE"'"}' \
+  | bash .claude/hardening/check-file-access.sh        # allow
 ```
 
-Now create the marker and try the same call:
+Now add a rule and try the same call again:
 
 ```bash
-: > .claude/hardening/.initialized
-echo '{"tool_name":"Write","tool_input":{"file_path":"'"$WORKSPACE"'/.claude/hardening/allow-paths.txt"},"cwd":"'"$WORKSPACE"'"}' \
-  | bash .claude/hardening/check-file-access.sh        # deny (workspace deny)
+echo "secrets/" >> .claude/hardening/deny-workspace-paths.txt
+echo '{"tool_name":"Write","tool_input":{"file_path":"'"$WORKSPACE"'/.claude/hardening/deny-workspace-paths.txt"},"cwd":"'"$WORKSPACE"'"}' \
+  | bash .claude/hardening/check-file-access.sh        # deny (.claude/ protection)
 ```
 
 ## Maintenance

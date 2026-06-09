@@ -6,17 +6,23 @@ allow or deny Read / Write / Edit / MultiEdit / NotebookEdit access
 based on policy files that live next to this script.
 
 Policy order:
-    0. Bootstrap window: if `.claude/hardening/.initialized` does not
-       exist and the target is **anywhere inside `.claude/`**, allow.
-       This lets a fresh checkout edit any hardening file (policy
-       lists, settings, scripts) and create the `.initialized`
-       marker without any other rule blocking it.
     1. If the tool is `Read` AND the target matches an entry in
        allow-paths.txt, allow.
     2. Deny if the target is outside the workspace root (event .cwd).
-    3. Deny if the target is **anywhere inside `.claude/`** (implicit
-       protection of the hardening config itself; active only after
-       `.initialized` exists).
+    3. Deny if the target is **anywhere inside `.claude/`**
+       (implicit protection of the hardening config itself).
+       *Exceptions:*
+         a) `deny-workspace-paths.txt` is always **readable** (so
+            the agent can inspect the deny list it is subject to)
+            and is **writable** while it has no active rules yet
+            (the one-shot first-time-setup window). The first rule
+            written closes the write exception; reads remain.
+         b) `settings.json` is always **readable** (so the agent
+            can inspect the active feature toggles, sandbox
+            config, etc.). It is **never writable** from Claude
+            Code's file tools — use `claude-sec configure` /
+            `claude-sec update-paths`, or edit the file in an
+            external editor.
     4. Deny if the target matches an entry in deny-workspace-paths.txt.
     5. Otherwise allow.
 
@@ -24,18 +30,21 @@ Note that allow-paths.txt grants **read-only** access. Write-shaped
 tools (Write / Edit / MultiEdit / NotebookEdit) never consult that
 list, so paths listed there can be read but not modified. The
 allow-paths read-override applies to step 3 too: a workspace path
-inside `.claude/` listed in allow-paths.txt remains readable after
-initialization, but writes to it are still denied.
+inside `.claude/` listed in allow-paths.txt remains readable, but
+writes to it are still denied.
 
 The implicit `.claude/` deny is the system-level lock on the
-hardening config. To re-open the policy for editing, the user
-deletes `.claude/hardening/.initialized` from outside Claude Code,
-which re-activates the bootstrap window.
+hardening config. Reads of `deny-workspace-paths.txt` and
+`settings.json` are always permitted; everything else in
+`.claude/` is fully sealed for Claude Code's file tools. The only
+write the agent ever gets to perform inside `.claude/` is the
+first-time population of `deny-workspace-paths.txt` while it is
+empty.
 
 Exit 0 with no output on allow. Emit a PreToolUse deny JSON object and
 exit 0 on deny (Claude Code reads the decision from stdout).
 
-Standard library only. Python 3.9+. macOS / Linux / Windows.
+Standard library only. Python 3.9+. macOS / Linux.
 """
 
 from __future__ import annotations
@@ -50,7 +59,7 @@ HARDENING_DIR = Path(__file__).resolve().parent
 CLAUDE_DIR = HARDENING_DIR.parent  # the .claude/ root
 ALLOW_PATHS_FILE = HARDENING_DIR / "allow-paths.txt"
 DENY_PATHS_FILE = HARDENING_DIR / "deny-workspace-paths.txt"
-INITIALIZED_FILE = HARDENING_DIR / ".initialized"
+SETTINGS_FILE = CLAUDE_DIR / "settings.json"
 
 # Tools we guard, and the tool_input key that carries the target path.
 # NotebookEdit uses `notebook_path`; the rest use `file_path`.
@@ -69,15 +78,13 @@ FILE_TOOLS = {
 # are effectively read-only.
 ALLOW_PATHS_TOOLS = {"Read"}
 
-# Case-insensitive comparison on Windows, case-sensitive elsewhere.
-# macOS HFS+/APFS volumes are often case-insensitive too, but we follow
-# the POSIX default rather than probing the filesystem.
-CASE_INSENSITIVE = os.name == "nt"
+# Path comparisons are case-sensitive (POSIX default). macOS HFS+/APFS
+# volumes are often case-insensitive, but we follow the POSIX default
+# rather than probing the filesystem.
 
 
 def _norm_for_compare(path: Path) -> str:
-    s = os.path.normpath(str(path))
-    return s.lower() if CASE_INSENSITIVE else s
+    return os.path.normpath(str(path))
 
 
 def _read_policy(path: Path) -> List[str]:
@@ -169,20 +176,12 @@ def main() -> int:
     allow_entries = _read_policy(ALLOW_PATHS_FILE)
     deny_entries = _read_policy(DENY_PATHS_FILE)
 
-    # 0. Bootstrap window: while .initialized is absent, allow access
-    #    to anything inside .claude/ so the agent (or the user via the
-    #    hardener-init wizard) can perform first-time setup. Once
-    #    .initialized exists this branch is skipped and normal policy
-    #    applies, including the implicit deny at step 3.
-    if target_in_claude and not INITIALIZED_FILE.exists():
-        return 0
-
     # 1. Allow if target matches an explicitly allowed path AND the
     #    tool is in the read-only allowlist. Write-shaped tools never
     #    short-circuit here, so allow-paths.txt entries are read-only.
     #    This intentionally runs before the implicit .claude/ deny so
     #    users can re-open a specific .claude/ subpath for reading
-    #    after initialization without giving up the write protection.
+    #    without giving up the write protection.
     if tool_name in ALLOW_PATHS_TOOLS:
         for entry in allow_entries:
             if _matches(target, _resolve(entry, workspace)):
@@ -205,17 +204,67 @@ def main() -> int:
         return 0
 
     # 3. Implicit deny on .claude/ — the hardening config itself is
-    #    not editable after initialization. To re-open it, delete
-    #    .claude/hardening/.initialized from outside Claude Code.
+    #    not editable. Two narrow read exceptions plus one narrow
+    #    write exception:
+    #      - deny-workspace-paths.txt is always readable and is
+    #        writable while it has no active rules yet (the one-shot
+    #        first-time-setup window);
+    #      - settings.json is always readable, never writable.
     if target_in_claude:
-        _deny(
-            f"{tool_name} denied: target is inside .claude/ "
-            f"(target={target}). The hardening config is "
-            f"implicitly protected after first-time setup. To edit "
-            f"it again, delete {INITIALIZED_FILE} from outside "
-            f"Claude Code to re-open the bootstrap window."
+        target_norm = _norm_for_compare(target)
+        deny_file_norm = _norm_for_compare(
+            _resolve(str(DENY_PATHS_FILE), workspace)
         )
-        return 0
+        settings_file_norm = _norm_for_compare(
+            _resolve(str(SETTINGS_FILE), workspace)
+        )
+        target_is_deny_file = target_norm == deny_file_norm
+        target_is_settings_file = target_norm == settings_file_norm
+        is_read_tool = tool_name in ALLOW_PATHS_TOOLS
+
+        allowed_by_exception = False
+        if is_read_tool and (target_is_deny_file or target_is_settings_file):
+            allowed_by_exception = True
+        elif target_is_deny_file and not deny_entries:
+            # Write-shaped tool on deny-workspace-paths.txt while
+            # the file has no active rules — one-shot setup window.
+            allowed_by_exception = True
+
+        if not allowed_by_exception:
+            if target_is_deny_file:
+                # Write attempt on deny-workspace-paths.txt after the
+                # one-shot window has closed.
+                _deny(
+                    f"{tool_name} denied: target is "
+                    f"{DENY_PATHS_FILE.name} but the file already has "
+                    f"active rules. This file is writable only while "
+                    f"it has no active rules (reads are always "
+                    f"allowed). Clear the file from outside Claude "
+                    f"Code to re-open the one-shot write window."
+                )
+            elif target_is_settings_file:
+                # Write attempt on settings.json (never writable).
+                _deny(
+                    f"{tool_name} denied: target is "
+                    f"{SETTINGS_FILE.name}. Settings.json is readable "
+                    f"but never writable from inside Claude Code. Use "
+                    f"`claude-sec configure` or `claude-sec "
+                    f"update-paths` from a terminal, or edit the file "
+                    f"directly in an external editor."
+                )
+            else:
+                # Any other path inside .claude/.
+                _deny(
+                    f"{tool_name} denied: target is inside .claude/ "
+                    f"(target={target}). The hardening config is "
+                    f"implicitly protected. Only "
+                    f"{DENY_PATHS_FILE.name} (read always, write "
+                    f"while empty) and {SETTINGS_FILE.name} (read "
+                    f"only) are reachable from Claude Code's file "
+                    f"tools; every other .claude/ file is fully "
+                    f"sealed."
+                )
+            return 0
 
     # 4. Deny if target matches a workspace deny entry.
     for entry in deny_entries:
@@ -226,7 +275,7 @@ def main() -> int:
             )
             return 0
 
-    # 4. Allow.
+    # 5. Allow.
     return 0
 
 

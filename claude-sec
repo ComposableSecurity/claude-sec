@@ -4,6 +4,16 @@
 # Subcommands:
 #   .              Copy this checkout's _claude/ template into ./.claude
 #                  in the current working directory.
+#   configure      Interactively enable optional security features (the
+#                  security-guidance plugin, the Bash review prompt, the
+#                  MCP audit prompt) by merging snippets from
+#                  ./.claude/hardening/features/ into ./.claude/settings.json.
+#                  Requires python3.
+#   update-paths   Mirror every active rule from
+#                  ./.claude/hardening/deny-workspace-paths.txt into
+#                  sandbox.filesystem.denyRead and denyWrite in
+#                  ./.claude/settings.json. Set-style merge: never removes
+#                  entries already in those lists. Idempotent. Requires python3.
 #   update         git pull --ff-only inside this checkout.
 #   self-install   Symlink this script into $CLAUDE_SEC_BIN_DIR so it's
 #                  available as `claude-sec` on $PATH. The script
@@ -21,8 +31,7 @@ BIN_DIR="${CLAUDE_SEC_BIN_DIR:-$HOME/.local/bin}"
 BIN_NAME="claude-sec"
 TEMPLATE_NAME="_claude"
 DEST_NAME=".claude"
-# Supported OS keys for the per-OS settings.*.json templates.
-SUPPORTED_OSES="unix windows"
+FEATURES_REL="hardening/features"   # path of features/ relative to DEST_NAME (or TEMPLATE_NAME)
 
 # ---------- colors ----------
 #
@@ -58,6 +67,15 @@ confirm() {
     case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
+# Same as confirm() but with a default-yes prompt — for recommended
+# follow-up actions where the empty answer should mean "go ahead".
+confirm_yes() {
+    local prompt="$1" ans
+    printf '%s %s? %s%s%s [Y/n]: ' "$TAG" "$C_YELLOW" "$C_RESET" "$prompt" ""
+    read -r ans || ans=""
+    case "$ans" in n|N|no|NO) return 1 ;; *) return 0 ;; esac
+}
+
 # Resolve the directory of this script, following symlinks portably
 # (so a self-installed symlink in $BIN_DIR resolves back to the repo).
 resolve_script_dir() {
@@ -73,26 +91,6 @@ resolve_script_dir() {
 
 SCRIPT_DIR="$(resolve_script_dir)"
 
-# Detect which settings.<os>.json template to use.
-# Overridable with CLAUDE_SEC_OS=unix|windows.
-detect_os() {
-    if [ -n "${CLAUDE_SEC_OS:-}" ]; then
-        printf '%s\n' "$CLAUDE_SEC_OS"
-        return
-    fi
-    case "$(uname -s 2>/dev/null || true)" in
-        Darwin*|Linux*|*BSD*)  echo unix ;;
-        CYGWIN*|MINGW*|MSYS*)  echo windows ;;
-        *)
-            if [ "${OS:-}" = "Windows_NT" ]; then
-                echo windows
-            else
-                die "could not detect OS — set CLAUDE_SEC_OS=unix|windows"
-            fi
-            ;;
-    esac
-}
-
 usage() {
     cat <<EOF
 ${C_BOLD}${C_CYAN}claude-sec${C_RESET} — install / update the Claude Code hardening template.
@@ -102,8 +100,16 @@ ${C_BOLD}USAGE${C_RESET}
 
 ${C_BOLD}SUBCOMMANDS${C_RESET}
     ${C_GREEN}.${C_RESET}              Copy this checkout's ${C_DIM}_claude/${C_RESET} into ${C_DIM}./.claude${C_RESET} in
-                   the current working directory. Picks the OS-specific
-                   settings template at install time.
+                   the current working directory.
+    ${C_GREEN}configure${C_RESET}      Interactively enable optional security features.
+                   Walks each feature in ${C_DIM}./.claude/hardening/features/${C_RESET},
+                   asks y/n, and merges the chosen snippets into
+                   ${C_DIM}./.claude/settings.json${C_RESET}. Idempotent — safe to re-run.
+    ${C_GREEN}update-paths${C_RESET}   Mirror every active rule from
+                   ${C_DIM}./.claude/hardening/deny-workspace-paths.txt${C_RESET} into
+                   ${C_DIM}sandbox.filesystem.denyRead${C_RESET} and ${C_DIM}denyWrite${C_RESET} in
+                   ${C_DIM}./.claude/settings.json${C_RESET}. Set-style merge — never
+                   removes existing entries. Idempotent.
     ${C_GREEN}update${C_RESET}         ${C_DIM}git pull --ff-only${C_RESET} inside this checkout.
     ${C_GREEN}self-install${C_RESET}   Symlink this script into ${C_DIM}BIN_DIR${C_RESET} so 'claude-sec'
                    works from any directory. Does ${C_BOLD}not${C_RESET} clone or move
@@ -113,28 +119,20 @@ ${C_BOLD}SUBCOMMANDS${C_RESET}
 ${C_BOLD}ENVIRONMENT${C_RESET}
     ${C_YELLOW}CLAUDE_SEC_BIN_DIR${C_RESET}   where to place the symlink
                          (default: ${C_DIM}$BIN_DIR${C_RESET})
-    ${C_YELLOW}CLAUDE_SEC_OS${C_RESET}        OS key for the settings template
-                         (one of: ${C_DIM}$SUPPORTED_OSES${C_RESET};
-                          default: auto-detected via ${C_DIM}uname${C_RESET})
     ${C_YELLOW}NO_COLOR${C_RESET}             set to disable ANSI colors
 EOF
 }
 
 # ---------- subcommands ----------
 
-# `.` — copy _claude/ into the current directory as .claude/, then
-#       promote the OS-specific settings.<os>.json to settings.json
-#       and drop the other variants.
+# `.` — copy _claude/ into the current directory as .claude/
 cmd_dot() {
     local src="$SCRIPT_DIR/$TEMPLATE_NAME"
     local dest="$PWD/$DEST_NAME"
-    local os settings_src
-    os="$(detect_os)"
-    settings_src="$src/settings.$os.json"
 
     [ -d "$src" ] || die "template not found at $src — is this script inside the claude-sec repo?"
-    [ -f "$settings_src" ] || \
-        die "no settings template for OS=$os at $settings_src — set CLAUDE_SEC_OS to one of: $SUPPORTED_OSES"
+    [ -f "$src/settings.json" ] || \
+        die "no settings.json in the template at $src — repo layout has changed?"
 
     if [ -e "$dest" ]; then
         [ -d "$dest" ] || die "destination exists and is not a directory: $dest"
@@ -143,19 +141,254 @@ cmd_dot() {
         rm -rf "$dest"
     fi
 
-    step "copying template (OS: ${C_BOLD}$os${C_RESET}) into $dest"
+    step "copying template into $dest"
     cp -R "$src" "$dest"
 
-    # Promote the OS-specific settings template; drop the other variants.
-    mv "$dest/settings.$os.json" "$dest/settings.json"
-    local other
-    for other in $SUPPORTED_OSES; do
-        [ "$other" = "$os" ] && continue
-        rm -f "$dest/settings.$other.json"
+    ok "template installed to $dest"
+    printf '\n'
+
+    if confirm_yes "would you like to customize the optional security layers now (recommended)?"; then
+        printf '\n'
+        cmd_configure
+    else
+        note "you can run ${C_BOLD}claude-sec configure${C_RESET}${C_DIM} from this directory whenever you're ready"
+    fi
+
+    printf '\n'
+    note "next, in Claude Code (open this project):"
+    note "  • run the ${C_BOLD}/claude-sec-fill-deny-paths${C_RESET}${C_DIM} skill to scan the project"
+    note "    for sensitive files and populate the deny list"
+    note "  • if you enabled the security-guidance plugin, run the"
+    note "    ${C_BOLD}/claude-sec-generate-security-guidance${C_RESET}${C_DIM} skill afterwards"
+}
+
+# `configure` — interactively enable optional security features by
+#               merging snippets from features/ into .claude/settings.json
+cmd_configure() {
+    local dest_settings="$PWD/$DEST_NAME/settings.json"
+    local features_dir="$PWD/$DEST_NAME/$FEATURES_REL"
+
+    [ -f "$dest_settings" ] || \
+        die "no $DEST_NAME/settings.json found in current directory — run 'claude-sec .' first"
+    [ -d "$features_dir" ] || \
+        die "no $DEST_NAME/$FEATURES_REL/ directory — run 'claude-sec .' first to install the template"
+    command -v python3 >/dev/null 2>&1 || \
+        die "python3 is required for 'configure' but was not found on PATH"
+
+    # Snapshot for atomic restore on failure.
+    local backup
+    backup="$(mktemp)"
+    cp "$dest_settings" "$backup"
+
+    step "configuring optional features in $dest_settings"
+    printf '\n'
+
+    local enabled_count=0
+    local feature_file
+    for feature_file in "$features_dir"/*.json; do
+        [ -f "$feature_file" ] || continue
+
+        # Pull title and description out of the snippet for the prompt.
+        local title description
+        title="$(_feature_meta "$feature_file" title)"
+        description="$(_feature_meta "$feature_file" description)"
+        [ -n "$title" ] || title="$(basename "$feature_file" .json)"
+
+        printf '%s %s%s%s\n'   "$TAG" "$C_BOLD" "$title" "$C_RESET"
+        if [ -n "$description" ]; then
+            # Wrap the description for legibility.
+            printf '%s   %s%s%s\n' "$TAG" "$C_DIM" "$description" "$C_RESET"
+        fi
+
+        if confirm "enable this feature?"; then
+            if ! _feature_apply "$feature_file" "$dest_settings"; then
+                warn "failed to apply $title — restoring previous settings"
+                cp "$backup" "$dest_settings"
+                rm -f "$backup"
+                die "configuration aborted"
+            fi
+            ok "enabled: $title"
+            enabled_count=$((enabled_count + 1))
+        else
+            note "skipped: $title"
+        fi
+        printf '\n'
     done
 
-    ok "template installed to $dest"
-    note "next: open Claude Code in this project and run /hardener-init"
+    rm -f "$backup"
+    ok "configuration complete ($enabled_count enabled)"
+}
+
+# Helper: read $2 from the snippet's top-level metadata.
+_feature_meta() {
+    local file="$1" key="$2"
+    python3 - "$file" "$key" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+val = data.get(sys.argv[2], "")
+if isinstance(val, str):
+    print(val)
+PYEOF
+}
+
+# Helper: deep-merge the snippet's "patch" into the target settings file.
+# Idempotent: dict keys merge by name, hook arrays upsert by `matcher`,
+# scalar arrays merge as a set, scalars replace. Writes back in-place.
+_feature_apply() {
+    local snippet="$1" dest="$2"
+    python3 - "$snippet" "$dest" <<'PYEOF'
+import json, sys, os
+
+snippet_path, dest_path = sys.argv[1], sys.argv[2]
+
+with open(snippet_path) as f:
+    snippet = json.load(f)
+with open(dest_path) as f:
+    settings = json.load(f)
+
+def merge(target, patch):
+    if isinstance(patch, dict) and isinstance(target, dict):
+        for k, v in patch.items():
+            target[k] = merge(target[k], v) if k in target else v
+        return target
+    if isinstance(patch, list) and isinstance(target, list):
+        out = list(target)
+        for item in patch:
+            if isinstance(item, dict) and "matcher" in item:
+                # Hook entries: upsert by matcher.
+                for i, existing in enumerate(out):
+                    if isinstance(existing, dict) and existing.get("matcher") == item["matcher"]:
+                        out[i] = item
+                        break
+                else:
+                    out.append(item)
+            else:
+                if item not in out:
+                    out.append(item)
+        return out
+    return patch
+
+merge(settings, snippet.get("patch", {}))
+
+# Write atomically: tmp + rename in the same dir as the destination so
+# we keep filesystem semantics (no cross-device rename).
+tmp = dest_path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+os.replace(tmp, dest_path)
+PYEOF
+}
+
+# `update-paths` — mirror deny-workspace-paths.txt active rules into
+#                  sandbox.filesystem.denyRead and denyWrite. Set-style
+#                  merge: existing entries are preserved, only missing
+#                  ones are added. Idempotent.
+cmd_update_paths() {
+    local dest_settings="$PWD/$DEST_NAME/settings.json"
+    local deny_paths_file="$PWD/$DEST_NAME/hardening/deny-workspace-paths.txt"
+
+    [ -f "$dest_settings" ] || \
+        die "no $DEST_NAME/settings.json found in current directory — run 'claude-sec .' first"
+    [ -f "$deny_paths_file" ] || \
+        die "no $DEST_NAME/hardening/deny-workspace-paths.txt found — run 'claude-sec .' first"
+    command -v python3 >/dev/null 2>&1 || \
+        die "python3 is required for 'update-paths' but was not found on PATH"
+
+    # Snapshot for atomic restore on failure.
+    local backup
+    backup="$(mktemp)"
+    cp "$dest_settings" "$backup"
+
+    step "mirroring active rules from $deny_paths_file into $dest_settings"
+
+    local stats=""
+    if ! stats="$(_update_paths_apply "$deny_paths_file" "$dest_settings")"; then
+        warn "failed to update settings — restoring from snapshot"
+        cp "$backup" "$dest_settings"
+        rm -f "$backup"
+        die "update-paths aborted"
+    fi
+    rm -f "$backup"
+
+    # Helper prints three space-separated counts on stdout:
+    # total_rules added_read added_write
+    local total_rules added_read added_write
+    read -r total_rules added_read added_write <<EOF
+$stats
+EOF
+
+    if [ "${total_rules:-0}" -eq 0 ]; then
+        ok "no active rules in deny-workspace-paths.txt — nothing to mirror"
+    elif [ "${added_read:-0}" -eq 0 ] && [ "${added_write:-0}" -eq 0 ]; then
+        ok "all $total_rules rule(s) already present in denyRead and denyWrite (no changes)"
+    else
+        ok "mirrored $total_rules rule(s): $added_read new in denyRead, $added_write new in denyWrite (existing entries preserved)"
+    fi
+}
+
+# Helper: read active rules from deny-workspace-paths.txt and add the
+# missing ones to sandbox.filesystem.denyRead and denyWrite in the
+# settings file. Writes the updated settings atomically. Prints three
+# space-separated counts on stdout: total_rules added_read added_write.
+_update_paths_apply() {
+    local deny_file="$1" dest="$2"
+    python3 - "$deny_file" "$dest" <<'PYEOF'
+import json, os, sys
+
+deny_file, dest = sys.argv[1], sys.argv[2]
+
+# Read active rules from deny-workspace-paths.txt.
+rules = []
+with open(deny_file, encoding="utf-8") as f:
+    for raw in f:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        rules.append(line)
+
+with open(dest, encoding="utf-8") as f:
+    settings = json.load(f)
+
+# Ensure sandbox.filesystem.denyRead and denyWrite exist as lists.
+sandbox = settings.setdefault("sandbox", {})
+if not isinstance(sandbox, dict):
+    print("error: sandbox is not an object in settings.json", file=sys.stderr)
+    sys.exit(1)
+fs = sandbox.setdefault("filesystem", {})
+if not isinstance(fs, dict):
+    print("error: sandbox.filesystem is not an object in settings.json", file=sys.stderr)
+    sys.exit(1)
+deny_read = fs.setdefault("denyRead", [])
+deny_write = fs.setdefault("denyWrite", [])
+for key, val in (("denyRead", deny_read), ("denyWrite", deny_write)):
+    if not isinstance(val, list):
+        print(f"error: sandbox.filesystem.{key} is not an array in settings.json", file=sys.stderr)
+        sys.exit(1)
+
+added_read = 0
+added_write = 0
+for rule in rules:
+    if rule not in deny_read:
+        deny_read.append(rule)
+        added_read += 1
+    if rule not in deny_write:
+        deny_write.append(rule)
+        added_write += 1
+
+# Atomic in-place write.
+tmp = dest + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+os.replace(tmp, dest)
+
+print(f"{len(rules)} {added_read} {added_write}")
+PYEOF
 }
 
 # `update` — git pull in this checkout
@@ -207,6 +440,8 @@ main() {
     local sub="$1"; shift
     case "$sub" in
         .|dot)            cmd_dot "$@" ;;
+        configure)        cmd_configure "$@" ;;
+        update-paths)     cmd_update_paths "$@" ;;
         update)           cmd_update "$@" ;;
         self-install)     cmd_self_install "$@" ;;
         help|-h|--help)   usage ;;

@@ -1,0 +1,19 @@
+{
+  "title": "Bash command file-access review prompt",
+  "description": "Adds a prompt-type PreToolUse hook on the Bash tool. Before each shell command, Claude is asked to inspect it for paths the file-access policy would block (outside-workspace or deny-listed) — including indirect uses like cp, rm, redirections, and process substitutions — and surface a permission prompt if any are touched. WARNING: this is a model-side check — Claude reviewing Claude's own intended actions — so it is non-deterministic and cannot be relied on as a 100% effective control. Use it as defense-in-depth alongside the deterministic file-access hook and sandbox, not as a substitute for them.",
+  "patch": {
+    "hooks": {
+      "PreToolUse": [
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "prompt",
+              "prompt": "Before running this Bash command, inspect it for paths that the file-access policy would block: (a) any path outside the workspace root (the current working directory), unless the path is listed in .claude/hardening/allow-paths.txt; or (b) any path inside the workspace that matches an entry in .claude/hardening/deny-workspace-paths.txt. This includes read operations (cat, less, head, tail, grep, find, etc.) and operations that consume the path indirectly (cp, mv, rm, tar, rsync, ln, sed -i, redirections, here-docs, and process substitutions). If the command references such a path, stop and ask the user for explicit confirmation before executing, naming each sensitive path and what the command will do with it. If the command references no such paths, proceed normally without prompting."
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

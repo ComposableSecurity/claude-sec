@@ -13,4 +13,3 @@
 # .env.local
 # secrets/
 # private/
-.env

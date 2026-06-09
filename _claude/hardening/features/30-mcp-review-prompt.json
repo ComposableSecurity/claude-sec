@@ -1,0 +1,19 @@
+{
+  "title": "MCP tool audit prompt",
+  "description": "Adds a prompt-type PreToolUse hook on every mcp__* tool call. Claude audits the tool via the Anthropic's /security-review skill, classifies it as safe or dangerous, refuses if it can bypass the local hardening, and remembers approvals so the same tool isn't audited twice. WARNING: this is a model-side check — Claude reviewing Claude's own intended actions — so it is non-deterministic and cannot be relied on as a 100% effective control. Use it as defense-in-depth alongside the deterministic file-access hook and sandbox, not as a substitute for them.",
+  "patch": {
+    "hooks": {
+      "PreToolUse": [
+        {
+          "matcher": "mcp__.*",
+          "hooks": [
+            {
+              "type": "prompt",
+              "prompt": "You are about to call an MCP tool (its name starts with `mcp__`). Audit it before the call proceeds.\n\n1. Identify the exact tool by its full name `mcp__<server>__<tool>`.\n\n2. If you have already approved this exact tool earlier in this session, or have recorded an approval for it in your persistent memory, skip steps 3-4 and proceed with the call.\n\n3. Otherwise, use the `/security-review` skill to review the tool. Classify it as DANGEROUS if it can do any of the following:\n   - Read, write, move, or delete files outside the workspace root, bypassing the `.claude/hardening/` file-access policy.\n   - Reach network destinations that `sandbox.network.deniedDomains: [\"*\"]` in `.claude/settings.json` would normally block.\n   - Execute arbitrary code, shell commands, or other unsandboxed processes.\n   - Read or transmit secrets, credentials, API tokens, or environment variables.\n\n4. If the tool is DANGEROUS: refuse the call, tell the user exactly which capability triggered the classification, and ask whether to override before retrying.\n\n5. If the tool is SAFE: record an approval for `mcp__<server>__<tool>` in your memory system (a short note keyed by the full tool name is sufficient), then proceed with the call. Future invocations of the same tool must short-circuit at step 2."
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

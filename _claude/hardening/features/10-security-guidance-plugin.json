@@ -1,0 +1,9 @@
+{
+  "title": "Anthropic security-guidance plugin",
+  "description": "Enables Anthropic's official security-guidance plugin so Claude Code automatically reviews code changes for security issues as they are made. Complements the local hardening: the file-access hook controls where the agent can edit, this plugin reviews what it edits.",
+  "patch": {
+    "enabledPlugins": {
+      "security-guidance@claude-plugins-official": true
+    }
+  }
+}
