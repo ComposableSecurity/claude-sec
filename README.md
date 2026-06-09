@@ -33,39 +33,7 @@ recipes are documented in
 documents the project layout and every parameter used in
 [`.claude/settings.json`](_claude/settings.json).
 
-## Layout
-
-This repository ships the hardening setup as a **template** under
-`_claude/`. The underscore prefix is intentional — it stops Claude
-Code from auto-applying the template to this repository itself
-during tool maintenance. End users install it as `.claude/` in
-their own project via [`./claude-sec .`](#installing-into-a-project).
-
-```text
-README.md                                  # this file: settings docs and project overview
-CLAUDE.md                                  # instructions for Claude Code itself
-claude-sec                                 # installer + configurator (see "Installing into a project")
-_claude/                                   # shipped template — copied to .claude/ at install
-  settings.json                            # security-floor settings
-  skills/
-    claude-sec-fill-deny-paths/
-      SKILL.md                             # scans the repo + populates deny-workspace-paths.txt (one-shot)
-    claude-sec-generate-security-guidance/
-      SKILL.md                             # drafts claude-security-guidance.md (plugin-gated)
-  hardening/
-    README.md                              # hook behavior + path policy docs
-    allow-paths.txt                        # external read-only paths
-    deny-workspace-paths.txt               # workspace paths Claude Code must NOT touch
-    check-file-access.py                   # PreToolUse hook implementation
-    check-file-access.sh                   # thin Bash wrapper
-    check-session-start.sh                 # SessionStart nudge
-    features/                              # optional-feature snippets used by `claude-sec configure`
-      README.md                            # feature-file format + merge semantics
-      10-security-guidance-plugin.json
-      20-bash-review-prompt.json
-      30-mcp-review-prompt.json
-```
-
+![claude-sec in use](static/claude-sec.gif)
 
 ## Installing into a project
 
